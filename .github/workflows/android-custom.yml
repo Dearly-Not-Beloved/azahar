@@ -1,0 +1,464 @@
+name: android-custom-build
+
+# Builds the Android (vanilla) app with "Export / Import Controller Layout" added to the
+# in-game overlay menu. Start it by hand: Actions > android-custom-build > Run workflow.
+#
+# Optional but recommended: add these repository secrets so every build is signed with the
+# same key and can update the previous one (Settings > Secrets and variables > Actions):
+#   ANDROID_KEYSTORE_B64   the .jks keystore, base64 encoded (single line)
+#   ANDROID_KEY_ALIAS      the key alias
+#   ANDROID_KEYSTORE_PASS  the keystore password (the key password must be the same)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-android-custom-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-android-custom-
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install ccache -y
+
+      - name: Update Android SDK CMake version
+        run: echo "y" | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "cmake;3.30.3"
+
+      - name: Add controller layout export/import
+        run: |
+          cat > src/android/app/src/main/java/org/citra/citra_emu/overlay/OverlayLayoutBackup.kt <<'KOTLIN_EOF'
+          // Personal modification for Azahar: export / import of the on-screen controller layout.
+          // Licensed under GPLv2 or any later version
+          // Refer to the misc/licenses/gplv2.txt file included.
+
+          package org.citra.citra_emu.overlay
+
+          import android.content.Context
+          import android.net.Uri
+          import android.util.Log
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.annotation.StringRes
+          import androidx.fragment.app.Fragment
+          import androidx.preference.PreferenceManager
+          import java.io.IOException
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+          import org.citra.citra_emu.R
+          import org.json.JSONException
+          import org.json.JSONObject
+
+          /**
+           * Serialises the on-screen controller layout to and from JSON.
+           *
+           * The overlay keeps its state in the app's default SharedPreferences (see InputOverlay and
+           * EmulationFragment), so a layout file is the subset of those entries that belong to the overlay:
+           *  - "<id>-X", "<id>-Y", "<id>-Portrait-X", "<id>-Portrait-Y": control positions (Float)
+           *  - "controlScale", "controlScale-<id>": global and per-control scale (Int, 0..150)
+           *  - "controlOpacity": opacity (Int, 0..100)
+           *  - "buttonToggle<n>": which controls are shown (Boolean)
+           *  - a few EmulationMenuSettings_* options (sliding, joystick relative center, haptics)
+           *
+           * Every key has a fixed expected type and range, which is also used to validate imported files,
+           * so a damaged or hand-edited file can neither crash the overlay nor touch unrelated settings.
+           */
+          object OverlayLayoutBackup {
+              private const val FORMAT_NAME = "azahar-overlay-layout"
+              private const val FORMAT_VERSION = 1
+              private const val FIELD_FORMAT = "format"
+              private const val FIELD_VERSION = "version"
+              private const val FIELD_SCREEN = "screen"
+              private const val FIELD_SCREEN_LONG = "long"
+              private const val FIELD_SCREEN_SHORT = "short"
+              private const val FIELD_VALUES = "values"
+
+              // InputOverlay re-applies its default layout when this flag is missing.
+              private const val KEY_OVERLAY_INIT = "OverlayInit"
+              private const val KEY_CONTROL_OPACITY = "controlOpacity"
+              private const val KEY_BUTTON_SLIDE_MODE = "EmulationMenuSettings_ButtonSlideMode"
+              private val BOOLEAN_MENU_KEYS = setOf(
+                  "EmulationMenuSettings_JoystickRelCenter",
+                  "EmulationMenuSettings_DpadSlideEnable",
+                  "EmulationMenuSettings_HapticFeedback"
+              )
+
+              // Positions are saved in pixels, so a layout made on another screen may need adjusting.
+              private const val SCREEN_TOLERANCE = 0.05
+
+              private val POSITION_KEY = Regex("""\d+(-Portrait)?-[XY]""")
+              private val SCALE_KEY = Regex("""controlScale(-\d+)?""")
+              private val TOGGLE_KEY = Regex("""buttonToggle\d+""")
+
+              private enum class ValueType { FLOAT, INT, BOOLEAN }
+
+              private class KeySpec(val type: ValueType, val min: Int = 0, val max: Int = 0)
+
+              /** Returns the expected type/range of an overlay key, or null if the key is not ours. */
+              private fun specFor(key: String): KeySpec? = when {
+                  POSITION_KEY.matches(key) -> KeySpec(ValueType.FLOAT)
+                  SCALE_KEY.matches(key) -> KeySpec(ValueType.INT, 0, 150)
+                  key == KEY_CONTROL_OPACITY -> KeySpec(ValueType.INT, 0, 100)
+                  key == KEY_BUTTON_SLIDE_MODE -> KeySpec(ValueType.INT, 0, 2)
+                  TOGGLE_KEY.matches(key) || key in BOOLEAN_MENU_KEYS -> KeySpec(ValueType.BOOLEAN)
+                  else -> null
+              }
+
+              class ImportResult(val appliedCount: Int, val screenDiffers: Boolean)
+
+              fun exportToJson(context: Context): String {
+                  val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+                  val values = JSONObject()
+                  for (entry in prefs.all.entries.sortedBy { it.key }) {
+                      val key = entry.key
+                      val value = entry.value ?: continue
+                      val spec = specFor(key) ?: continue
+                      when (spec.type) {
+                          ValueType.FLOAT -> if (value is Float) values.put(key, value.toDouble())
+                          ValueType.INT -> if (value is Int) values.put(key, value)
+                          ValueType.BOOLEAN -> if (value is Boolean) values.put(key, value)
+                      }
+                  }
+
+                  val metrics = context.resources.displayMetrics
+                  val screen = JSONObject()
+                      .put(FIELD_SCREEN_LONG, max(metrics.widthPixels, metrics.heightPixels))
+                      .put(FIELD_SCREEN_SHORT, min(metrics.widthPixels, metrics.heightPixels))
+                  return JSONObject()
+                      .put(FIELD_FORMAT, FORMAT_NAME)
+                      .put(FIELD_VERSION, FORMAT_VERSION)
+                      .put(FIELD_SCREEN, screen)
+                      .put(FIELD_VALUES, values)
+                      .toString(2)
+              }
+
+              /**
+               * Replaces the current overlay layout with the one in [json]. Everything is parsed and
+               * validated before any preference is touched, so a bad file never leaves a half-applied layout.
+               *
+               * @throws JSONException or IllegalArgumentException if the file is not a valid layout file
+               */
+              @Throws(JSONException::class, IllegalArgumentException::class)
+              fun importFromJson(context: Context, json: String): ImportResult {
+                  val root = JSONObject(json)
+                  require(root.optString(FIELD_FORMAT) == FORMAT_NAME) { "Not an Azahar overlay layout file" }
+                  require(root.optInt(FIELD_VERSION, -1) == FORMAT_VERSION) { "Unsupported file version" }
+                  val values = root.getJSONObject(FIELD_VALUES)
+
+                  val parsed = LinkedHashMap<String, Any>()
+                  for (key in values.keys()) {
+                      // Keys we do not know are ignored, never written.
+                      val spec = specFor(key) ?: continue
+                      parsed[key] = when (spec.type) {
+                          ValueType.FLOAT -> {
+                              val number = values.getDouble(key)
+                              require(number.isFinite()) { "Invalid position for $key" }
+                              number.toFloat()
+                          }
+
+                          ValueType.INT -> {
+                              val number = values.getInt(key)
+                              require(number in spec.min..spec.max) { "Value out of range for $key" }
+                              number
+                          }
+
+                          ValueType.BOOLEAN -> values.getBoolean(key)
+                      }
+                  }
+                  require(parsed.isNotEmpty()) { "File contains no layout data" }
+
+                  val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+                  val editor = prefs.edit()
+                  // Drop the current overlay entries first so nothing stale survives the import.
+                  for (existingKey in prefs.all.keys) {
+                      if (specFor(existingKey) != null) {
+                          editor.remove(existingKey)
+                      }
+                  }
+                  for ((key, value) in parsed) {
+                      when (value) {
+                          is Float -> editor.putFloat(key, value)
+                          is Int -> editor.putInt(key, value)
+                          is Boolean -> editor.putBoolean(key, value)
+                      }
+                  }
+                  editor.putBoolean(KEY_OVERLAY_INIT, true)
+                  editor.apply()
+
+                  val screen = root.optJSONObject(FIELD_SCREEN)
+                  val metrics = context.resources.displayMetrics
+                  val screenDiffers = screen == null ||
+                      !isSimilar(
+                          screen.optInt(FIELD_SCREEN_LONG),
+                          max(metrics.widthPixels, metrics.heightPixels)
+                      ) ||
+                      !isSimilar(
+                          screen.optInt(FIELD_SCREEN_SHORT),
+                          min(metrics.widthPixels, metrics.heightPixels)
+                      )
+                  return ImportResult(parsed.size, screenDiffers)
+              }
+
+              private fun isSimilar(saved: Int, current: Int): Boolean =
+                  saved > 0 && abs(saved - current) <= current * SCREEN_TOLERANCE
+          }
+
+          /**
+           * Connects [OverlayLayoutBackup] to the system file picker (Storage Access Framework), so no
+           * storage permission is needed. Create it as a property of the fragment: the activity-result
+           * launchers must be registered before the fragment is started.
+           *
+           * @param onLayoutImported called after a layout was imported, to redraw the overlay
+           */
+          class OverlayLayoutFileHandler(
+              private val fragment: Fragment,
+              private val onLayoutImported: () -> Unit
+          ) {
+              private val exportLauncher = fragment.registerForActivityResult(
+                  ActivityResultContracts.CreateDocument("application/json")
+              ) { uri: Uri? ->
+                  if (uri != null) {
+                      writeLayout(uri)
+                  }
+              }
+
+              private val importLauncher = fragment.registerForActivityResult(
+                  ActivityResultContracts.OpenDocument()
+              ) { uri: Uri? ->
+                  if (uri != null) {
+                      readLayout(uri)
+                  }
+              }
+
+              fun launchExport() = exportLauncher.launch(DEFAULT_FILE_NAME)
+
+              // Some file managers report .json files as octet-stream, so do not filter by MIME type here;
+              // importFromJson() validates the content anyway.
+              fun launchImport() = importLauncher.launch(arrayOf("*/*"))
+
+              private fun writeLayout(uri: Uri) {
+                  val context = fragment.context ?: return
+                  try {
+                      val json = OverlayLayoutBackup.exportToJson(context)
+                      val stream = context.contentResolver.openOutputStream(uri, "wt")
+                          ?: throw IOException("Could not open the output file")
+                      stream.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+                      toast(context, R.string.overlay_layout_export_success)
+                  } catch (e: IOException) {
+                      Log.e(TAG, "Layout export failed", e)
+                      toast(context, R.string.overlay_layout_export_failed)
+                  } catch (e: JSONException) {
+                      Log.e(TAG, "Layout export failed", e)
+                      toast(context, R.string.overlay_layout_export_failed)
+                  }
+              }
+
+              private fun readLayout(uri: Uri) {
+                  val context = fragment.context ?: return
+                  try {
+                      val stream = context.contentResolver.openInputStream(uri)
+                          ?: throw IOException("Could not open the input file")
+                      val text = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                      val result = OverlayLayoutBackup.importFromJson(context, text)
+                      onLayoutImported()
+                      if (result.screenDiffers) {
+                          toast(context, R.string.overlay_layout_import_screen_differs, Toast.LENGTH_LONG)
+                      } else {
+                          toast(context, R.string.overlay_layout_import_success)
+                      }
+                  } catch (e: IOException) {
+                      Log.e(TAG, "Layout import failed", e)
+                      toast(context, R.string.overlay_layout_import_failed)
+                  } catch (e: JSONException) {
+                      Log.e(TAG, "Layout file is not valid JSON", e)
+                      toast(context, R.string.overlay_layout_import_invalid)
+                  } catch (e: IllegalArgumentException) {
+                      Log.e(TAG, "Layout file rejected", e)
+                      toast(context, R.string.overlay_layout_import_invalid)
+                  }
+              }
+
+              private fun toast(
+                  context: Context,
+                  @StringRes message: Int,
+                  length: Int = Toast.LENGTH_SHORT
+              ) = Toast.makeText(context, message, length).show()
+
+              private companion object {
+                  const val TAG = "OverlayLayoutFiles"
+                  const val DEFAULT_FILE_NAME = "azahar_overlay_layout.json"
+              }
+          }
+          KOTLIN_EOF
+
+          python3 - <<'PYTHON_EOF'
+          """Adds export/import of the on-screen controller layout to the Azahar Android app.
+
+          Every edit is anchored on an exact piece of existing text. If upstream changed that text the
+          script stops with a clear message instead of producing a half-patched tree.
+          """
+          import pathlib
+          import sys
+
+          APP = pathlib.Path("src/android/app")
+          MAIN = APP / "src/main"
+          FRAGMENT = MAIN / "java/org/citra/citra_emu/fragments/EmulationFragment.kt"
+
+
+          def edit(path, old, new):
+              text = path.read_text(encoding="utf-8")
+              found = text.count(old)
+              if found != 1:
+                  sys.exit(f"::error::Anchor found {found} times (expected 1) in {path}:\n{old}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+              print(f"patched {path}")
+
+
+          # 1. Fragment: import, file handler property, two menu actions.
+          edit(
+              FRAGMENT,
+              "import org.citra.citra_emu.model.Game\n",
+              "import org.citra.citra_emu.model.Game\n"
+              "import org.citra.citra_emu.overlay.OverlayLayoutFileHandler\n",
+          )
+          edit(
+              FRAGMENT,
+              "    private val args by navArgs<EmulationFragmentArgs>()\n",
+              "    private val args by navArgs<EmulationFragmentArgs>()\n"
+              "\n"
+              "    private val overlayLayoutFiles = OverlayLayoutFileHandler(this) {\n"
+              "        _binding?.surfaceInputOverlay?.refreshControls()\n"
+              "    }\n",
+          )
+          edit(
+              FRAGMENT,
+              "                R.id.menu_emulation_reset_overlay -> {\n",
+              "                R.id.menu_emulation_export_layout -> {\n"
+              "                    overlayLayoutFiles.launchExport()\n"
+              "                    true\n"
+              "                }\n"
+              "\n"
+              "                R.id.menu_emulation_import_layout -> {\n"
+              "                    overlayLayoutFiles.launchImport()\n"
+              "                    true\n"
+              "                }\n"
+              "\n"
+              "                R.id.menu_emulation_reset_overlay -> {\n",
+          )
+
+          # 2. Overlay options menu: two new entries under "Reset Overlay".
+          edit(
+              MAIN / "res/menu/menu_overlay_options.xml",
+              '    <item\n'
+              '        android:id="@+id/menu_emulation_reset_overlay"\n'
+              '        android:title="@string/emulation_touch_overlay_reset" />\n',
+              '    <item\n'
+              '        android:id="@+id/menu_emulation_reset_overlay"\n'
+              '        android:title="@string/emulation_touch_overlay_reset" />\n'
+              '\n'
+              '    <item\n'
+              '        android:id="@+id/menu_emulation_export_layout"\n'
+              '        android:title="@string/overlay_layout_export" />\n'
+              '\n'
+              '    <item\n'
+              '        android:id="@+id/menu_emulation_import_layout"\n'
+              '        android:title="@string/overlay_layout_import" />\n',
+          )
+
+          # 3. Strings (English; other languages fall back to this).
+          edit(
+              MAIN / "res/values/strings.xml",
+              '    <string name="emulation_touch_overlay_reset">Reset Overlay</string>\n',
+              '    <string name="emulation_touch_overlay_reset">Reset Overlay</string>\n'
+              '    <string name="overlay_layout_export">Export Controller Layout</string>\n'
+              '    <string name="overlay_layout_import">Import Controller Layout</string>\n'
+              '    <string name="overlay_layout_export_success">Controller layout exported</string>\n'
+              '    <string name="overlay_layout_export_failed">Could not export the controller layout</string>\n'
+              '    <string name="overlay_layout_import_success">Controller layout imported</string>\n'
+              '    <string name="overlay_layout_import_screen_differs">Controller layout imported, but it '
+              'was made for a different screen size. Use Edit Layout to adjust the buttons.</string>\n'
+              '    <string name="overlay_layout_import_invalid">This is not a valid Azahar controller '
+              'layout file</string>\n'
+              '    <string name="overlay_layout_import_failed">Could not read the file</string>\n',
+          )
+
+          # 4. Build time only: phones are arm64, so skip compiling the x86_64 emulator core.
+          edit(
+              APP / "build.gradle.kts",
+              'val abiFilter = listOf("arm64-v8a", "x86_64")\n',
+              'val abiFilter = listOf("arm64-v8a")\n',
+          )
+          PYTHON_EOF
+
+          git status --short
+
+      - name: Report signing mode
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::warning title=No signing key::ANDROID_KEYSTORE_B64 is not set, so this APK is signed with a temporary key and cannot update a build made by an earlier run."
+          fi
+
+      - name: Build
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+        run: |
+          export NDK_CCACHE=$(which ccache)
+          if [ -n "${ANDROID_KEYSTORE_B64}" ]; then
+            export ANDROID_KEYSTORE_FILE="${GITHUB_WORKSPACE}/ks.jks"
+            base64 --decode <<< "${ANDROID_KEYSTORE_B64}" > "${ANDROID_KEYSTORE_FILE}"
+          fi
+          cd src/android
+          chmod +x ./gradlew
+          JAVA_HOME=$JAVA_HOME_17_X64 ./gradlew assembleVanillaRelease
+          ccache -s
+          if [ -n "${ANDROID_KEYSTORE_B64}" ]; then
+            rm "${ANDROID_KEYSTORE_FILE}"
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: azahar-custom-apk
+          path: src/android/app/build/outputs/apk/vanilla/release/*.apk
+          if-no-files-found: error
+
+      # Easier on a phone than unzipping the artifact: the APK becomes a normal download
+      # on the repository's Releases page. If this step fails, use the artifact above.
+      - name: Publish APK as a pre-release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(ls src/android/app/build/outputs/apk/vanilla/release/*.apk | head -n 1)
+          cp "$APK" "azahar-custom-${GITHUB_RUN_NUMBER}.apk"
+          gh release create "custom-${GITHUB_RUN_NUMBER}" "azahar-custom-${GITHUB_RUN_NUMBER}.apk" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Custom build ${GITHUB_RUN_NUMBER}" \
+            --notes "Azahar (vanilla) with controller layout export/import. Source commit: ${GITHUB_SHA}"
