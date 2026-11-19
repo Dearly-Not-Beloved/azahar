@@ -58,9 +58,6 @@ jobs:
           import android.net.Uri
           import android.util.Log
           import android.widget.Toast
-          import androidx.activity.result.contract.ActivityResultContracts
-          import androidx.annotation.StringRes
-          import androidx.fragment.app.Fragment
           import androidx.preference.PreferenceManager
           import java.io.IOException
           import kotlin.math.abs
@@ -225,89 +222,101 @@ jobs:
           }
 
           /**
-           * Connects [OverlayLayoutBackup] to the system file picker (Storage Access Framework), so no
-           * storage permission is needed. Create it as a property of the fragment: the activity-result
-           * launchers must be registered before the fragment is started.
+           * Reads and writes layout files for [OverlayLayoutBackup] and tells the user what happened.
            *
-           * @param onLayoutImported called after a layout was imported, to redraw the overlay
+           * The file pickers themselves are registered in EmulationActivity, like the app's other
+           * in-game pickers (amiibo, camera image), because that is the object that reliably receives the
+           * result. The system picker needs no storage permission.
+           *
+           * Every outcome shows a message, including the reason when something fails, so a failure is
+           * never silent.
            */
-          class OverlayLayoutFileHandler(
-              private val fragment: Fragment,
-              private val onLayoutImported: () -> Unit
-          ) {
-              private val exportLauncher = fragment.registerForActivityResult(
-                  ActivityResultContracts.CreateDocument("application/json")
-              ) { uri: Uri? ->
-                  if (uri != null) {
-                      writeLayout(uri)
-                  }
-              }
+          object OverlayLayoutFiles {
+              const val DEFAULT_FILE_NAME = "azahar_overlay_layout.json"
+              private const val TAG = "OverlayLayoutFiles"
 
-              private val importLauncher = fragment.registerForActivityResult(
-                  ActivityResultContracts.OpenDocument()
-              ) { uri: Uri? ->
-                  if (uri != null) {
-                      readLayout(uri)
-                  }
-              }
-
-              fun launchExport() = exportLauncher.launch(DEFAULT_FILE_NAME)
-
-              // Some file managers report .json files as octet-stream, so do not filter by MIME type here;
-              // importFromJson() validates the content anyway.
-              fun launchImport() = importLauncher.launch(arrayOf("*/*"))
-
-              private fun writeLayout(uri: Uri) {
-                  val context = fragment.context ?: return
+              fun exportTo(context: Context, uri: Uri) {
                   try {
-                      val json = OverlayLayoutBackup.exportToJson(context)
-                      val stream = context.contentResolver.openOutputStream(uri, "wt")
-                          ?: throw IOException("Could not open the output file")
-                      stream.use { it.write(json.toByteArray(Charsets.UTF_8)) }
-                      toast(context, R.string.overlay_layout_export_success)
-                  } catch (e: IOException) {
+                      val bytes = OverlayLayoutBackup.exportToJson(context).toByteArray(Charsets.UTF_8)
+                      val output = context.contentResolver.openOutputStream(uri, "wt")
+                          ?: throw IOException("The file could not be opened for writing")
+                      output.use { it.write(bytes) }
+
+                      // Some file providers accept the write but leave the file empty, so check it.
+                      val stored = context.contentResolver.openInputStream(uri)
+                          ?.use { it.readBytes().size } ?: -1
+                      if (stored != bytes.size) {
+                          throw IOException("Expected ${bytes.size} bytes but the file has $stored")
+                      }
+                      toast(context, context.getString(R.string.overlay_layout_export_success, bytes.size))
+                  } catch (e: Exception) {
                       Log.e(TAG, "Layout export failed", e)
-                      toast(context, R.string.overlay_layout_export_failed)
-                  } catch (e: JSONException) {
-                      Log.e(TAG, "Layout export failed", e)
-                      toast(context, R.string.overlay_layout_export_failed)
+                      toast(
+                          context,
+                          context.getString(R.string.overlay_layout_export_failed, describe(e)),
+                          Toast.LENGTH_LONG
+                      )
                   }
               }
 
-              private fun readLayout(uri: Uri) {
-                  val context = fragment.context ?: return
+              /** @return true if a layout was imported, so the caller can redraw the overlay */
+              fun importFrom(context: Context, uri: Uri): Boolean {
                   try {
                       val stream = context.contentResolver.openInputStream(uri)
-                          ?: throw IOException("Could not open the input file")
+                          ?: throw IOException("The file could not be opened")
                       val text = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-                      val result = OverlayLayoutBackup.importFromJson(context, text)
-                      onLayoutImported()
-                      if (result.screenDiffers) {
-                          toast(context, R.string.overlay_layout_import_screen_differs, Toast.LENGTH_LONG)
-                      } else {
-                          toast(context, R.string.overlay_layout_import_success)
+                      if (text.isBlank()) {
+                          toast(
+                              context,
+                              context.getString(R.string.overlay_layout_import_empty),
+                              Toast.LENGTH_LONG
+                          )
+                          return false
                       }
-                  } catch (e: IOException) {
-                      Log.e(TAG, "Layout import failed", e)
-                      toast(context, R.string.overlay_layout_import_failed)
+                      val result = OverlayLayoutBackup.importFromJson(context, text)
+                      if (result.screenDiffers) {
+                          toast(
+                              context,
+                              context.getString(R.string.overlay_layout_import_screen_differs),
+                              Toast.LENGTH_LONG
+                          )
+                      } else {
+                          toast(context, context.getString(R.string.overlay_layout_import_success))
+                      }
+                      return true
                   } catch (e: JSONException) {
-                      Log.e(TAG, "Layout file is not valid JSON", e)
-                      toast(context, R.string.overlay_layout_import_invalid)
+                      return importRejected(context, e)
                   } catch (e: IllegalArgumentException) {
-                      Log.e(TAG, "Layout file rejected", e)
-                      toast(context, R.string.overlay_layout_import_invalid)
+                      return importRejected(context, e)
+                  } catch (e: Exception) {
+                      Log.e(TAG, "Layout import failed", e)
+                      toast(
+                          context,
+                          context.getString(R.string.overlay_layout_import_failed, describe(e)),
+                          Toast.LENGTH_LONG
+                      )
+                      return false
                   }
               }
 
-              private fun toast(
-                  context: Context,
-                  @StringRes message: Int,
-                  length: Int = Toast.LENGTH_SHORT
-              ) = Toast.makeText(context, message, length).show()
+              private fun importRejected(context: Context, e: Exception): Boolean {
+                  Log.e(TAG, "Layout file rejected", e)
+                  toast(
+                      context,
+                      context.getString(R.string.overlay_layout_import_invalid, describe(e)),
+                      Toast.LENGTH_LONG
+                  )
+                  return false
+              }
 
-              private companion object {
-                  const val TAG = "OverlayLayoutFiles"
-                  const val DEFAULT_FILE_NAME = "azahar_overlay_layout.json"
+              private fun describe(e: Exception): String {
+                  val reason = e.message
+                  val name = e.javaClass.simpleName
+                  return if (reason.isNullOrBlank()) name else "$name: $reason"
+              }
+
+              private fun toast(context: Context, message: String, length: Int = Toast.LENGTH_SHORT) {
+                  Toast.makeText(context, message, length).show()
               }
           }
           KOTLIN_EOF
@@ -323,7 +332,9 @@ jobs:
 
           APP = pathlib.Path("src/android/app")
           MAIN = APP / "src/main"
-          FRAGMENT = MAIN / "java/org/citra/citra_emu/fragments/EmulationFragment.kt"
+          CODE = MAIN / "java/org/citra/citra_emu"
+          FRAGMENT = CODE / "fragments/EmulationFragment.kt"
+          ACTIVITY = CODE / "activities/EmulationActivity.kt"
 
 
           def edit(path, old, new):
@@ -335,39 +346,73 @@ jobs:
               print(f"patched {path}")
 
 
-          # 1. Fragment: import, file handler property, two menu actions.
+          # 1. Activity: own the file pickers, exactly like the existing amiibo / camera-image pickers.
+          edit(
+              ACTIVITY,
+              "import org.citra.citra_emu.model.Game\n",
+              "import org.citra.citra_emu.model.Game\n"
+              "import org.citra.citra_emu.overlay.OverlayLayoutFiles\n",
+          )
+          edit(
+              ACTIVITY,
+              "    companion object {\n"
+              "        private var instance: EmulationActivity? = null\n",
+              "    val exportOverlayLayoutLauncher =\n"
+              "        registerForActivityResult(\n"
+              "            ActivityResultContracts.CreateDocument(\"application/json\")\n"
+              "        ) { uri: Uri? ->\n"
+              "            if (uri != null) {\n"
+              "                OverlayLayoutFiles.exportTo(this, uri)\n"
+              "            }\n"
+              "        }\n"
+              "\n"
+              "    val importOverlayLayoutLauncher =\n"
+              "        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->\n"
+              "            if (uri != null && OverlayLayoutFiles.importFrom(this, uri)) {\n"
+              "                // The overlay reads its layout when it is created, so make it reload now.\n"
+              "                runCatching { emulationFragment.refreshOverlayControls() }\n"
+              "            }\n"
+              "        }\n"
+              "\n"
+              "    companion object {\n"
+              "        private var instance: EmulationActivity? = null\n",
+          )
+
+          # 2. Fragment: two menu actions that start those pickers, plus a public overlay refresh.
           edit(
               FRAGMENT,
               "import org.citra.citra_emu.model.Game\n",
               "import org.citra.citra_emu.model.Game\n"
-              "import org.citra.citra_emu.overlay.OverlayLayoutFileHandler\n",
-          )
-          edit(
-              FRAGMENT,
-              "    private val args by navArgs<EmulationFragmentArgs>()\n",
-              "    private val args by navArgs<EmulationFragmentArgs>()\n"
-              "\n"
-              "    private val overlayLayoutFiles = OverlayLayoutFileHandler(this) {\n"
-              "        _binding?.surfaceInputOverlay?.refreshControls()\n"
-              "    }\n",
+              "import org.citra.citra_emu.overlay.OverlayLayoutFiles\n",
           )
           edit(
               FRAGMENT,
               "                R.id.menu_emulation_reset_overlay -> {\n",
               "                R.id.menu_emulation_export_layout -> {\n"
-              "                    overlayLayoutFiles.launchExport()\n"
+              "                    emulationActivity.exportOverlayLayoutLauncher.launch(\n"
+              "                        OverlayLayoutFiles.DEFAULT_FILE_NAME\n"
+              "                    )\n"
               "                    true\n"
               "                }\n"
               "\n"
               "                R.id.menu_emulation_import_layout -> {\n"
-              "                    overlayLayoutFiles.launchImport()\n"
+              "                    emulationActivity.importOverlayLayoutLauncher.launch(arrayOf(\"*/*\"))\n"
               "                    true\n"
               "                }\n"
               "\n"
               "                R.id.menu_emulation_reset_overlay -> {\n",
           )
+          edit(
+              FRAGMENT,
+              "    fun updateShowPerformanceOverlay() {\n",
+              "    fun refreshOverlayControls() {\n"
+              "        _binding?.surfaceInputOverlay?.refreshControls()\n"
+              "    }\n"
+              "\n"
+              "    fun updateShowPerformanceOverlay() {\n",
+          )
 
-          # 2. Overlay options menu: two new entries under "Reset Overlay".
+          # 3. Overlay options menu: two new entries under "Reset Overlay".
           edit(
               MAIN / "res/menu/menu_overlay_options.xml",
               '    <item\n'
@@ -386,24 +431,28 @@ jobs:
               '        android:title="@string/overlay_layout_import" />\n',
           )
 
-          # 3. Strings (English; other languages fall back to this).
+          # 4. Strings (English; other languages fall back to this).
           edit(
               MAIN / "res/values/strings.xml",
               '    <string name="emulation_touch_overlay_reset">Reset Overlay</string>\n',
               '    <string name="emulation_touch_overlay_reset">Reset Overlay</string>\n'
               '    <string name="overlay_layout_export">Export Controller Layout</string>\n'
               '    <string name="overlay_layout_import">Import Controller Layout</string>\n'
-              '    <string name="overlay_layout_export_success">Controller layout exported</string>\n'
-              '    <string name="overlay_layout_export_failed">Could not export the controller layout</string>\n'
+              '    <string name="overlay_layout_export_success">Controller layout exported (%1$d bytes)'
+              '</string>\n'
+              '    <string name="overlay_layout_export_failed">Could not export the controller layout: '
+              '%1$s</string>\n'
               '    <string name="overlay_layout_import_success">Controller layout imported</string>\n'
               '    <string name="overlay_layout_import_screen_differs">Controller layout imported, but it '
               'was made for a different screen size. Use Edit Layout to adjust the buttons.</string>\n'
+              '    <string name="overlay_layout_import_empty">The file is empty. Export the layout again '
+              'and import that new file.</string>\n'
               '    <string name="overlay_layout_import_invalid">This is not a valid Azahar controller '
-              'layout file</string>\n'
-              '    <string name="overlay_layout_import_failed">Could not read the file</string>\n',
+              'layout file (%1$s)</string>\n'
+              '    <string name="overlay_layout_import_failed">Could not read the file: %1$s</string>\n',
           )
 
-          # 4. Build time only: phones are arm64, so skip compiling the x86_64 emulator core.
+          # 5. Build time only: phones are arm64, so skip compiling the x86_64 emulator core.
           edit(
               APP / "build.gradle.kts",
               'val abiFilter = listOf("arm64-v8a", "x86_64")\n',
